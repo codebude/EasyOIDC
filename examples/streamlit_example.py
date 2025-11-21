@@ -4,7 +4,7 @@ from EasyOIDC.session import SessionHandler
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 st.set_page_config(page_title="EasyOIDC", page_icon=":lock:", initial_sidebar_state="collapsed", layout="wide", menu_items=None)
-session_store = SessionHandler(mode='redis')
+session_store = SessionHandler(mode='shelve')
 
 auth_config = Config('.env')
 auth_config.redirect_uri = 'http://localhost:5000'

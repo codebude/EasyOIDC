@@ -7,7 +7,7 @@ from EasyOIDC.utils import is_path_matched
 from EasyOIDC.session import SessionHandler
 from nicegui import Client, app, ui
 
-session_store = SessionHandler(mode='redis')
+session_store = SessionHandler(mode='shelve')
 
 auth_config = Config('.env')
 auth = OIDClient(auth_config)

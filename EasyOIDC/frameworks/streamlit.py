@@ -19,7 +19,7 @@ class StreamlitODICClient:
         if auth_config is None:
             auth_config = Config('.env')
         if session_storage is None:
-            session_storage = SessionHandler(mode='redis')
+            session_storage = SessionHandler(mode='shelve')
 
         auth_config.redirect_uri = remove_path_from_url(auth_config.redirect_uri)
         super().__init__(auth_config, log_enabled)

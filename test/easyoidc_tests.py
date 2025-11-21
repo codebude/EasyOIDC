@@ -35,7 +35,7 @@ def test_validate_config():
 
 
 def test_session_storage():
-    session_store = SessionHandler(mode='redis')
+    session_store = SessionHandler(mode='shelve')
     session_store.get('test', 'default')
     session_store.set('test', 'other')
     assert session_store.get('test', 'default') == 'other'

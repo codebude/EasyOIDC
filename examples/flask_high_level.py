@@ -3,7 +3,7 @@ from EasyOIDC import Config, SessionHandler
 from EasyOIDC.frameworks.flask import FlaskOIDClient
 
 app = Flask(__name__)
-session_storage = SessionHandler(mode='redis', namespace=__name__)
+session_storage = SessionHandler(mode='shelve', namespace=__name__)
 auth_config = Config('.env')
 auth = FlaskOIDClient(app, auth_config=auth_config, session_storage=session_storage)
 

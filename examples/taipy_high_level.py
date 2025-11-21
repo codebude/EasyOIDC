@@ -6,7 +6,7 @@ import taipy.gui.builder as tgb
 from taipy.gui import Markdown
 
 app = Flask(__name__)
-session_storage = SessionHandler(mode='redis', namespace=__name__)
+session_storage = SessionHandler(mode='shelve', namespace=__name__)
 auth_config = Config('.env')
 auth = TaipyOIDClient(app, auth_config=auth_config, session_storage=session_storage)
 

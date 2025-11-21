@@ -34,7 +34,7 @@ from EasyOIDC import Config, SessionHandler
 from EasyOIDC.frameworks.flask import FlaskOIDClient
 
 app = Flask(__name__)
-session_storage = SessionHandler(mode='redis')
+session_storage = SessionHandler(mode='shelve')
 auth_config = Config('.env')
 auth = FlaskOIDClient(app, auth_config=auth_config, session_storage=session_storage)
 
@@ -143,15 +143,13 @@ config = Config(client_id='my_client_id',
 
 ### Server session data storage
 
-EasyOIDC needs to store some data in the server session, like tokens and authenticated user information. The library provides a SessionHandler class that can be used to store the session data in memory, in a file or in a Redis database. The SessionHandler class is initialized as follows:
+EasyOIDC needs to store some data in the server session, like tokens and authenticated user information. The library provides a SessionHandler class that can be used to store the session data in memory, in a file. The SessionHandler class is initialized as follows:
 
 ```python
 from EasyOIDC import SessionHandler
 
-# Redis memory storage
-session_storage = SessionHandler(mode='redis')
 
-# or for file storage
+# File storage
 session_storage = SessionHandler(mode='shelve')
 
 ```

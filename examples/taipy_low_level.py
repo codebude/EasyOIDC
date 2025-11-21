@@ -16,7 +16,7 @@ session_store = shelve.open("session_data/sessions.db")
 for key in session_store.keys():
     del session_store[key]
 """
-session_store = SessionHandler(mode='redis')
+session_store = SessionHandler(mode='shelve')
 
 auth_config = Config('.env')
 auth = OIDClient(auth_config)
