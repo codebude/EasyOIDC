@@ -7,6 +7,7 @@ from EasyOIDC.utils import is_path_matched
 from EasyOIDC.session import SessionHandler
 from EasyOIDC.frameworks import SESSION_STATE_VAR_NAME, REFERRER_VAR_NAME
 from nicegui.app import App
+from nicegui import app
 import logging
 
 
@@ -47,11 +48,18 @@ class NiceGUIOIDClient(OIDClient):
 
         self.set_redirector(lambda url: RedirectResponse(url))
 
-        self.set_roles_getter(
-            lambda: self._session_storage[nicegui_app.storage.user.get(SESSION_STATE_VAR_NAME, '')].get('userinfo',
-                                                                                                        {}).get(
-                'realm_access', {}).get(
-                'roles', []))
+        # Roles getter that safely accesses app.storage.user only in UI context
+        def get_roles():
+            try:
+                state = app.storage.user.get(SESSION_STATE_VAR_NAME, '')
+                if state and state in self._session_storage:
+                    return self._session_storage[state].get('userinfo', {}).get('realm_access', {}).get('roles', [])
+            except RuntimeError:
+                # Not in UI context, return empty roles
+                pass
+            return []
+        
+        self.set_roles_getter(get_roles)
 
         # Add FastAPI route /login to method login_route_handler
         self._nicegui_app.add_route(auth_config.app_login_route, self._login_route_handler)
@@ -68,7 +76,9 @@ class NiceGUIOIDClient(OIDClient):
     def _authorize_route_handler(self, request: Request) -> Response:
         try:
             state = request.query_params['state']
-            assert state == self._nicegui_app.storage.user.get(SESSION_STATE_VAR_NAME, None)
+            # Get state from cookie instead of app.storage.user
+            cookie_state = request.cookies.get(SESSION_STATE_VAR_NAME, None)
+            assert state == cookie_state
 
             token, oauth_session = self.get_token(str(request.url))
             userinfo = self.get_user_info(oauth_session)
@@ -79,53 +89,89 @@ class NiceGUIOIDClient(OIDClient):
         except Exception as e:
             if self._log_enabled:
                 self.logger.debug(f"Authentication error: '{e}'. Redirecting to login page...")
-            RedirectResponse(self._auth_config.app_login_route)
+            return RedirectResponse(self._auth_config.app_login_route)
 
-        referrer_path = self._nicegui_app.storage.user.get(REFERRER_VAR_NAME, '')
-        if referrer_path:
-            return RedirectResponse(referrer_path)
-        else:
-            return RedirectResponse('/')
+        # Get referrer from cookie instead of app.storage.user
+        referrer_path = request.cookies.get(REFERRER_VAR_NAME, '')
+        response = RedirectResponse(referrer_path if referrer_path else '/')
+        
+        # Set session state cookie
+        response.set_cookie(
+            key=SESSION_STATE_VAR_NAME,
+            value=state,
+            httponly=True,
+            samesite='lax'
+        )
+        # Clear referrer cookie
+        response.delete_cookie(REFERRER_VAR_NAME)
+        
+        return response
 
     def _login_route_handler(self, request: Request) -> Response:
         uri, state = self.auth_server_login()
-        self._nicegui_app.storage.user.update({SESSION_STATE_VAR_NAME: state})
         self._session_storage[state] = {'userinfo': None, 'token': None}
-        return RedirectResponse(uri)
+        
+        # Store state in cookie instead of app.storage.user
+        response = RedirectResponse(uri)
+        response.set_cookie(
+            key=SESSION_STATE_VAR_NAME,
+            value=state,
+            httponly=True,
+            samesite='lax'
+        )
+        return response
 
-    def _get_current_token(self):
-        state = self._nicegui_app.storage.user.get(SESSION_STATE_VAR_NAME, '')
-        if state in self._session_storage:
+    def _get_current_token(self, state=None):
+        if state is None:
+            # Try to get from UI context
+            try:
+                state = app.storage.user.get(SESSION_STATE_VAR_NAME, '')
+            except RuntimeError:
+                # Not in UI context
+                return None
+        if state and state in self._session_storage:
             return self._session_storage[state]['token']
         return None
 
-    def _logout(self):
+    def _logout(self, state):
         logout_url = None
-        token = self._get_current_token()
+        token = self._get_current_token(state)
         if token:
             if self._auth_config.logout_endpoint:
                 logout_url = self.get_logout_url(token.get('id_token', None))
-            del self._session_storage[self._nicegui_app.storage.user.get(SESSION_STATE_VAR_NAME)]
-        self._nicegui_app.storage.user.update({SESSION_STATE_VAR_NAME: None, REFERRER_VAR_NAME: ''})
+            if state in self._session_storage:
+                del self._session_storage[state]
         return logout_url
 
     def _logout_route_handler(self, request: Request) -> Response:
-        logout_url = self._logout()
-        if logout_url:
-            return RedirectResponse(logout_url)
-        else:
-            return RedirectResponse(self._auth_config.post_logout_uri)
+        state = request.cookies.get(SESSION_STATE_VAR_NAME, None)
+        logout_url = self._logout(state)
+        
+        response = RedirectResponse(logout_url if logout_url else self._auth_config.post_logout_uri)
+        # Clear cookies
+        response.delete_cookie(SESSION_STATE_VAR_NAME)
+        response.delete_cookie(REFERRER_VAR_NAME)
+        
+        return response
 
     def is_authenticated(self):
-        state = self._nicegui_app.storage.user.get(SESSION_STATE_VAR_NAME, None)
-        if (state in self._session_storage) and (self._session_storage[state]['userinfo']):
-            return True
+        try:
+            state = app.storage.user.get(SESSION_STATE_VAR_NAME, None)
+            if state and (state in self._session_storage) and (self._session_storage[state]['userinfo']):
+                return True
+        except RuntimeError:
+            # Not in UI context, cannot determine authentication state
+            pass
         return False
 
     def get_userinfo(self):
-        state = self._nicegui_app.storage.user.get(SESSION_STATE_VAR_NAME, None)
-        if (state in self._session_storage) and (self._session_storage[state]['userinfo']):
-            return self._session_storage[state]['userinfo']
+        try:
+            state = app.storage.user.get(SESSION_STATE_VAR_NAME, None)
+            if state and (state in self._session_storage) and (self._session_storage[state]['userinfo']):
+                return self._session_storage[state]['userinfo']
+        except RuntimeError:
+            # Not in UI context, cannot get userinfo
+            pass
         return None
 
 
@@ -139,7 +185,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         authenticated = False
         config = self.oidc_client.get_config()
-        session_state = self.nicegui_app.storage.user.get(SESSION_STATE_VAR_NAME, None)
+        # Get session state from cookie instead of app.storage.user
+        session_state = request.cookies.get(SESSION_STATE_VAR_NAME, None)
         unrestricted_page_routes = self.oidc_client.get_config().get_unrestricted_routes()
         login_route = config.app_login_route
         page_unrestricted = any(is_path_matched(request.url.path, pattern) for pattern in unrestricted_page_routes)
@@ -155,17 +202,36 @@ class AuthMiddleware(BaseHTTPMiddleware):
             # Check if the requested path matches with unrestricted_page_routes.
             if not page_unrestricted:
                 path_without_domain = request.url.path + ('?' + request.url.query if request.url.query else '')
-                self.nicegui_app.storage.user[REFERRER_VAR_NAME] = '/' if path_without_domain is None \
-                    else path_without_domain
+                # Store referrer in cookie instead of app.storage.user
+                response = RedirectResponse(login_route)
+                response.set_cookie(
+                    key=REFERRER_VAR_NAME,
+                    value='/' if path_without_domain is None else path_without_domain,
+                    httponly=True,
+                    samesite='lax'
+                )
                 if self.log_enabled:
-                    self.logger.debug(
-                        f"After login will redirect to '{self.nicegui_app.storage.user[REFERRER_VAR_NAME]}'")
-                return RedirectResponse(login_route)
+                    self.logger.debug(f"After login will redirect to '{path_without_domain}'")
+                return response
         else:
-            referrer_path = self.nicegui_app.storage.user.get(REFERRER_VAR_NAME, '')
+            # Check if there's a referrer to redirect to
+            referrer_path = request.cookies.get(REFERRER_VAR_NAME, '')
             if referrer_path:
-                self.nicegui_app.storage.user[REFERRER_VAR_NAME] = ''
                 if self.log_enabled:
                     self.logger.debug('Redirecting to', referrer_path)
-                return RedirectResponse(referrer_path)
-        return await call_next(request)
+                response = RedirectResponse(referrer_path)
+                response.delete_cookie(REFERRER_VAR_NAME)
+                return response
+        
+        # Sync session state to app.storage.user for UI context
+        response = await call_next(request)
+        
+        # If this is a UI page request and we have a session, sync to app.storage.user
+        if session_state and authenticated:
+            try:
+                app.storage.user[SESSION_STATE_VAR_NAME] = session_state
+            except RuntimeError:
+                # Not in UI context yet, that's okay
+                pass
+        
+        return response
