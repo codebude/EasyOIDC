@@ -1,7 +1,64 @@
 import shelve
 import threading
-import dbm.sqlite3
+import sqlite3
+import pickle
 import os
+
+
+class ThreadSafeSQLiteDict:
+    """A thread-safe SQLite-backed dictionary for use with shelve."""
+    
+    def __init__(self, filename):
+        self.filename = filename
+        self._lock = threading.RLock()
+        # Create connection with check_same_thread=False
+        self._conn = sqlite3.connect(filename, check_same_thread=False)
+        self._conn.execute(
+            'CREATE TABLE IF NOT EXISTS shelf (key TEXT PRIMARY KEY, value BLOB)'
+        )
+        self._conn.commit()
+    
+    def __getitem__(self, key):
+        with self._lock:
+            cursor = self._conn.execute('SELECT value FROM shelf WHERE key = ?', (key,))
+            row = cursor.fetchone()
+            if row is None:
+                raise KeyError(key)
+            return pickle.loads(row[0])
+    
+    def __setitem__(self, key, value):
+        with self._lock:
+            self._conn.execute(
+                'INSERT OR REPLACE INTO shelf (key, value) VALUES (?, ?)',
+                (key, pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
+            )
+            self._conn.commit()
+    
+    def __delitem__(self, key):
+        with self._lock:
+            cursor = self._conn.execute('DELETE FROM shelf WHERE key = ?', (key,))
+            if cursor.rowcount == 0:
+                raise KeyError(key)
+            self._conn.commit()
+    
+    def __contains__(self, key):
+        with self._lock:
+            cursor = self._conn.execute('SELECT 1 FROM shelf WHERE key = ?', (key,))
+            return cursor.fetchone() is not None
+    
+    def keys(self):
+        with self._lock:
+            cursor = self._conn.execute('SELECT key FROM shelf')
+            return [row[0] for row in cursor.fetchall()]
+    
+    def clear(self):
+        with self._lock:
+            self._conn.execute('DELETE FROM shelf')
+            self._conn.commit()
+    
+    def close(self):
+        with self._lock:
+            self._conn.close()
 
 
 class SessionHandler:
@@ -13,10 +70,8 @@ class SessionHandler:
             # Ensure directory exists
             os.makedirs(os.path.dirname(filename) if os.path.dirname(filename) else '.', exist_ok=True)
             
-            # Open dbm.sqlite3 with check_same_thread=False for thread safety
-            # We use the lock to ensure thread-safe access
-            self._db = dbm.sqlite3.open(filename, 'c', check_same_thread=False)
-            self.shelve_store = shelve.Shelf(self._db)
+            # Use our custom thread-safe SQLite dict
+            self.shelve_store = ThreadSafeSQLiteDict(filename)
         else:
             raise Exception(f"Unknown mode: {mode}")
 
