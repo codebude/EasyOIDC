@@ -1,4 +1,4 @@
-from fastapi import Request
+from fastapi import Request, FastAPI
 from fastapi.responses import RedirectResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Route
@@ -21,7 +21,7 @@ class NiceGUIOIDClient(OIDClient):
     logger = logging.getLogger(__name__)
 
     def __init__(self, nicegui_app: App, auth_config: Config = None, session_storage: SessionHandler = None,
-                 log_enabled: bool = True, **kwargs):
+                 log_enabled: bool = True, fastapi_app: FastAPI = None, **kwargs):
         if auth_config is None:
             auth_config = Config('.env')
         if session_storage is None:
@@ -50,7 +50,18 @@ class NiceGUIOIDClient(OIDClient):
         auth_middleware.oidc_client = self
         auth_middleware.log_enabled = log_enabled
         auth_middleware.nicegui_app = nicegui_app
+        # register middleware in NiceGUI app
         self._nicegui_app.add_middleware(auth_middleware)
+        # also register middleware in the provided FastAPI app (if any) so native handlers
+        # go through the same middleware logic and we can leverage set request.state etc.
+        if fastapi_app is not None:
+            try:
+                fastapi_app.add_middleware(auth_middleware)
+                if self.logger:
+                    self.logger.debug('AuthMiddleware registered on provided FastAPI app.')
+            except Exception as e:
+                if self.logger:
+                    self.logger.debug(f'Unable to register AuthMiddleware on provided FastAPI app: {e}')
 
         self.set_redirector(lambda url: RedirectResponse(url))
 
