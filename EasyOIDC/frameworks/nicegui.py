@@ -70,6 +70,20 @@ class NiceGUIOIDClient(OIDClient):
         # Add FastAPI route /logout to method logout_route_handler
         self._nicegui_app.add_route(auth_config.app_logout_route, self._logout_route_handler)
 
+        # Register a handler to initialize UI storage when a new websocket client connects
+        try:
+            # The on_connect hook is provided by NiceGUI and will be called in UI/websocket context
+            self._nicegui_app.on_connect(self._on_connect_handler)
+            # Also hook disconnect to cleanup optional UI storage
+            try:
+                self._nicegui_app.on_disconnect(self._on_disconnect_handler)
+            except Exception:
+                # not all NiceGUI versions expose on_disconnect; ignore if missing
+                pass
+        except Exception:
+            # If the app does not expose on_connect, skip silently; fallback remains cookies
+            pass
+
     def set_logger(self, logger):
         self.logger = logger
 
@@ -100,11 +114,36 @@ class NiceGUIOIDClient(OIDClient):
             key=SESSION_STATE_VAR_NAME,
             value=state,
             httponly=True,
-            samesite='lax'
+            samesite='lax',
+            path='/'
         )
         # Clear referrer cookie
         response.delete_cookie(REFERRER_VAR_NAME)
         
+        # Try to update connected UI clients' storage.user with the new session state.
+        # Not all NiceGUI versions expose a clients collection; attempt multiple ways gracefully.
+        try:
+            clients = getattr(self._nicegui_app, 'clients', None) or getattr(app, 'clients', None)
+            if clients:
+                # clients might be a dict or list of Client objects
+                iterable = clients.values() if isinstance(clients, dict) else clients
+                for client in iterable:
+                    try:
+                        # many client objects expose `storage` property
+                        if hasattr(client, 'storage') and hasattr(client.storage, 'user'):
+                            client.storage.user[SESSION_STATE_VAR_NAME] = state
+                            if self.logger:
+                                self.logger.debug(f"Authorize: set client.storage.user[{SESSION_STATE_VAR_NAME}]={state}")
+                    except Exception:
+                        # fall back to global app; might still raise if not in UI context
+                        try:
+                            app.storage.user[SESSION_STATE_VAR_NAME] = state
+                        except Exception:
+                            pass
+        except Exception:
+            # Silently ignore if clients aren't accessible
+            pass
+
         return response
 
     def _login_route_handler(self, request: Request) -> Response:
@@ -117,7 +156,8 @@ class NiceGUIOIDClient(OIDClient):
             key=SESSION_STATE_VAR_NAME,
             value=state,
             httponly=True,
-            samesite='lax'
+            samesite='lax',
+            path='/'
         )
         return response
 
@@ -132,6 +172,56 @@ class NiceGUIOIDClient(OIDClient):
         if state and state in self._session_storage:
             return self._session_storage[state]['token']
         return None
+
+    async def _on_connect_handler(self, client):
+        """Initialize `app.storage.user` for the connecting client based on cookies.
+        This runs in a UI/websocket context where `app.storage.user` is available.
+        """
+        # Attempt to read cookies from the websocket handshake request headers
+        try:
+            cookies_header = None
+            # Client may expose `request.headers` in different versions
+            if hasattr(client, 'request') and hasattr(client.request, 'headers'):
+                cookies_header = client.request.headers.get('cookie', '')
+            elif hasattr(client, 'scope') and isinstance(client.scope, dict):
+                # headers are as list of tuples in scope
+                headers = dict((k.decode('latin1'), v.decode('latin1')) for k, v in client.scope.get('headers', []))
+                cookies_header = headers.get('cookie', '')
+            elif hasattr(client, 'headers'):
+                cookies_header = client.headers.get('cookie', '')
+
+            if cookies_header:
+                from http.cookies import SimpleCookie
+                cookie = SimpleCookie()
+                cookie.load(cookies_header)
+                if SESSION_STATE_VAR_NAME in cookie:
+                    state = cookie[SESSION_STATE_VAR_NAME].value
+                    # Sync this client's storage.user
+                    try:
+                        app.storage.user[SESSION_STATE_VAR_NAME] = state
+                        if self.logger:
+                            self.logger.debug(f"On connect: set app.storage.user[{SESSION_STATE_VAR_NAME}]={state}")
+                    except Exception:
+                        # If the UI runtime throws (unlikely in on_connect), ignore
+                        pass
+                else:
+                    if self.logger:
+                        self.logger.debug('On connect: no session-state cookie present')
+        except Exception:
+            # If any of the above fails, don't break the websocket connection
+            pass
+
+    async def _on_disconnect_handler(self, client):
+        """Clear `app.storage.user` for the disconnecting client to avoid stale data."""
+        try:
+            # Only attempt to clear UI storage (available in websocket context)
+            try:
+                app.storage.user[SESSION_STATE_VAR_NAME] = None
+            except Exception:
+                # App may not support storage updates in this NiceGUI version
+                pass
+        except Exception:
+            pass
 
     def _logout(self, state):
         logout_url = None
@@ -154,7 +244,7 @@ class NiceGUIOIDClient(OIDClient):
         
         return response
 
-    def is_authenticated(self):
+    def is_authenticated(self, request: Request = None):
         try:
             state = app.storage.user.get(SESSION_STATE_VAR_NAME, None)
             if state and (state in self._session_storage) and (self._session_storage[state]['userinfo']):
@@ -162,15 +252,31 @@ class NiceGUIOIDClient(OIDClient):
         except RuntimeError:
             # Not in UI context, cannot determine authentication state
             pass
+        # Fallback: if a request is provided, check cookie-based session state
+        try:
+            if request is not None:
+                state = request.cookies.get(SESSION_STATE_VAR_NAME, None)
+                if state and (state in self._session_storage) and (self._session_storage[state]['userinfo']):
+                    return True
+        except Exception:
+            pass
         return False
 
-    def get_userinfo(self):
+    def get_userinfo(self, request: Request = None):
         try:
             state = app.storage.user.get(SESSION_STATE_VAR_NAME, None)
             if state and (state in self._session_storage) and (self._session_storage[state]['userinfo']):
                 return self._session_storage[state]['userinfo']
         except RuntimeError:
             # Not in UI context, cannot get userinfo
+            pass
+        # Fallback: if a request is provided, check cookie-based session state
+        try:
+            if request is not None:
+                state = request.cookies.get(SESSION_STATE_VAR_NAME, None)
+                if state and (state in self._session_storage) and (self._session_storage[state]['userinfo']):
+                    return self._session_storage[state]['userinfo']
+        except Exception:
             pass
         return None
 
@@ -204,11 +310,13 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 path_without_domain = request.url.path + ('?' + request.url.query if request.url.query else '')
                 # Store referrer in cookie instead of app.storage.user
                 response = RedirectResponse(login_route)
+                # set referrer cookie with path
                 response.set_cookie(
                     key=REFERRER_VAR_NAME,
                     value='/' if path_without_domain is None else path_without_domain,
                     httponly=True,
-                    samesite='lax'
+                    samesite='lax',
+                    path='/'
                 )
                 if self.log_enabled:
                     self.logger.debug(f"After login will redirect to '{path_without_domain}'")
