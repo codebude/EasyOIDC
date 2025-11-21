@@ -8,6 +8,12 @@ from EasyOIDC.session import SessionHandler
 from EasyOIDC.frameworks import SESSION_STATE_VAR_NAME, REFERRER_VAR_NAME
 from nicegui.app import App
 from nicegui import app
+import contextvars
+
+# Context variable to hold the current Request during middleware processing so
+# `NiceGUIOIDClient.is_authenticated()` and `get_userinfo()` can access the request
+# in non-UI contexts without requiring the caller to pass it explicitly.
+CURRENT_REQUEST: contextvars.ContextVar[Request] = contextvars.ContextVar('CURRENT_REQUEST', default=None)
 import logging
 
 
@@ -49,14 +55,37 @@ class NiceGUIOIDClient(OIDClient):
         self.set_redirector(lambda url: RedirectResponse(url))
 
         # Roles getter that safely accesses app.storage.user only in UI context
-        def get_roles():
+        def get_roles(request: Request = None):
+            # First, try UI context
             try:
                 state = app.storage.user.get(SESSION_STATE_VAR_NAME, '')
                 if state and state in self._session_storage:
                     return self._session_storage[state].get('userinfo', {}).get('realm_access', {}).get('roles', [])
             except RuntimeError:
-                # Not in UI context, return empty roles
+                # Not in UI context, continue to fallback
                 pass
+
+            # If no request is provided, try to retrieve it from context var
+            if request is None:
+                try:
+                    request = CURRENT_REQUEST.get()
+                except Exception:
+                    request = None
+
+            if request is not None:
+                # prefer request.state.userinfo
+                if hasattr(request, 'state') and getattr(request.state, 'userinfo', None):
+                    userinfo = request.state.userinfo
+                    return userinfo.get('realm_access', {}).get('roles', []) if userinfo else []
+                # fallback to cookie based session state
+                try:
+                    state = request.cookies.get(SESSION_STATE_VAR_NAME, None)
+                    if state and state in self._session_storage:
+                        return self._session_storage[state].get('userinfo', {}).get('realm_access', {}).get('roles', [])
+                except Exception:
+                    pass
+
+            # no roles available
             return []
         
         self.set_roles_getter(get_roles)
@@ -252,9 +281,19 @@ class NiceGUIOIDClient(OIDClient):
         except RuntimeError:
             # Not in UI context, cannot determine authentication state
             pass
-        # Fallback: if a request is provided, check cookie-based session state
+        # Fallback: determine the Request either from the provided parameter, the
+        # CURRENT_REQUEST context var (set by middleware), or None
+        if request is None:
+            try:
+                request = CURRENT_REQUEST.get()
+            except Exception:
+                request = None
+        # Fallback: if a request is available, check request.state.userinfo, then cookies
         try:
             if request is not None:
+                # Prefer the request.state set by middleware
+                if hasattr(request, 'state') and getattr(request.state, 'userinfo', None):
+                    return True
                 state = request.cookies.get(SESSION_STATE_VAR_NAME, None)
                 if state and (state in self._session_storage) and (self._session_storage[state]['userinfo']):
                     return True
@@ -270,9 +309,17 @@ class NiceGUIOIDClient(OIDClient):
         except RuntimeError:
             # Not in UI context, cannot get userinfo
             pass
-        # Fallback: if a request is provided, check cookie-based session state
+        # Fallback: determine request source like `is_authenticated` does
+        if request is None:
+            try:
+                request = CURRENT_REQUEST.get()
+            except Exception:
+                request = None
+        # Fallback: check request.state then cookies
         try:
             if request is not None:
+                if hasattr(request, 'state') and getattr(request.state, 'userinfo', None):
+                    return request.state.userinfo
                 state = request.cookies.get(SESSION_STATE_VAR_NAME, None)
                 if state and (state in self._session_storage) and (self._session_storage[state]['userinfo']):
                     return self._session_storage[state]['userinfo']
@@ -301,6 +348,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
             token = self.session_storage[session_state]['token']
             # Verifica la sesión contra el servidor
             authenticated = self.oidc_client.is_valid_oidc_session(self.oidc_client.get_oauth_session(token))
+            # Attach session info to the request.state for easier access in downstream handlers
+            try:
+                request.state.session_state = session_state
+                request.state.userinfo = self.session_storage[session_state].get('userinfo')
+            except Exception:
+                pass
 
         if not authenticated:
             if session_state and (session_state in self.session_storage):
@@ -331,8 +384,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 response.delete_cookie(REFERRER_VAR_NAME)
                 return response
         
-        # Sync session state to app.storage.user for UI context
-        response = await call_next(request)
+        # Set current request context var for downstream lookups
+        token = CURRENT_REQUEST.set(request)
+        try:
+            # Sync session state to app.storage.user for UI context
+            response = await call_next(request)
+        finally:
+            # Reset context var to previous value
+            CURRENT_REQUEST.reset(token)
         
         # If this is a UI page request and we have a session, sync to app.storage.user
         if session_state and authenticated:

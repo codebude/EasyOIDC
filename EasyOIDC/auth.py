@@ -1,4 +1,5 @@
 from authlib.integrations.requests_client import OAuth2Session
+from fastapi import Request
 from urllib.parse import quote, quote_plus
 from functools import wraps
 from EasyOIDC.config import Config
@@ -138,9 +139,14 @@ class OIDClient(object):
         url = self.get_logout_url(id_token)
         return requests.get(url)
 
-    def get_user_roles(self):
+    def get_user_roles(self, request: Request = None):
         # Retrieve the user roles using the roles getter function
-        return self._roles_getter()
+        try:
+            # Pass request along if the roles getter accepts it; otherwise, ignore
+            return self._roles_getter(request) if request is not None else self._roles_getter()
+        except TypeError:
+            # roles_getter does not expect parameters
+            return self._roles_getter()
 
     # and_allow_roles: List of roles that must be fulfilled (all of them)
     # or_allow_roles: List of roles that can be fulfilled (any of them)
